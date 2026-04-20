@@ -176,12 +176,23 @@ class PromptRequest(BaseModel):
     prompt: str
 
 
+class WordTrace(BaseModel):
+    original: str
+    output: str
+    bit: str
+    angle: float
+    operation: str  # "skip" | "synonym" | "modifier" | "unchanged"
+    qubit: int
+
+
 class TransformResponse(BaseModel):
     original: str
     mutated: str
     bitstring: str
     qubits_used: int
     mutations: int
+    trace: list[WordTrace]
+    angles: list[float]
 
 
 def build_circuit(prompt: str) -> tuple[QuantumCircuit, int, list[float]]:
@@ -203,7 +214,7 @@ def build_circuit(prompt: str) -> tuple[QuantumCircuit, int, list[float]]:
     return qc, n, angles
 
 
-def mutate_prompt(prompt: str, bitstring: str, angles: list[float]) -> tuple[str, int]:
+def mutate_prompt(prompt: str, bitstring: str, angles: list[float]) -> tuple[str, int, list[WordTrace]]:
     """
     Use measurement bitstring + qubit angles to transform every
     meaningful word in the prompt.
@@ -219,9 +230,13 @@ def mutate_prompt(prompt: str, bitstring: str, angles: list[float]) -> tuple[str
     words = prompt.split()
     result = []
     mutations = 0
+    trace: list[WordTrace] = []
+    qubit_idx = 0
 
     for i, word in enumerate(words):
-        bit = int(bitstring[i % len(bitstring)])
+        bit_char = bitstring[i % len(bitstring)]
+        bit = int(bit_char)
+        angle = angles[i % len(angles)] if angles else 1.0
         punct = ""
         clean = word.lower()
         if clean and clean[-1] in ".,;:!?":
@@ -231,6 +246,15 @@ def mutate_prompt(prompt: str, bitstring: str, angles: list[float]) -> tuple[str
         # Always keep skip words unchanged
         if clean in SKIP_WORDS:
             result.append(word)
+            trace.append(WordTrace(
+                original=word,
+                output=word,
+                bit=bit_char,
+                angle=round(angle, 4),
+                operation="skip",
+                qubit=qubit_idx % 16,
+            ))
+            qubit_idx += 1
             continue
 
         if bit == 1:
@@ -239,22 +263,48 @@ def mutate_prompt(prompt: str, bitstring: str, angles: list[float]) -> tuple[str
                 options = SYNONYMS[clean]
                 idx_bits = bitstring[(i + 1) % len(bitstring)] + bitstring[(i + 2) % len(bitstring)]
                 idx = int(idx_bits, 2) % len(options)
-                result.append(options[idx] + punct)
+                output = options[idx] + punct
+                result.append(output)
                 mutations += 1
+                trace.append(WordTrace(
+                    original=word,
+                    output=output,
+                    bit=bit_char,
+                    angle=round(angle, 4),
+                    operation="synonym",
+                    qubit=qubit_idx % 16,
+                ))
             else:
                 # Inject quantum modifier derived from the 2-bit group index
                 group_bits = bitstring[(i + 1) % len(bitstring)] + bitstring[(i + 2) % len(bitstring)]
                 group = int(group_bits, 2) % len(QUANTUM_MODIFIERS)
-                # Pick modifier within group using the angle magnitude
-                angle = angles[i % len(angles)] if angles else 1.0
                 mod_idx = int((angle / math.pi) * len(QUANTUM_MODIFIERS[group])) % len(QUANTUM_MODIFIERS[group])
                 modifier = QUANTUM_MODIFIERS[group][mod_idx]
-                result.append(modifier + " " + word)
+                output = modifier + " " + word
+                result.append(output)
                 mutations += 1
+                trace.append(WordTrace(
+                    original=word,
+                    output=output,
+                    bit=bit_char,
+                    angle=round(angle, 4),
+                    operation="modifier",
+                    qubit=qubit_idx % 16,
+                ))
         else:
             result.append(word)
+            trace.append(WordTrace(
+                original=word,
+                output=word,
+                bit=bit_char,
+                angle=round(angle, 4),
+                operation="unchanged",
+                qubit=qubit_idx % 16,
+            ))
 
-    return " ".join(result), mutations
+        qubit_idx += 1
+
+    return " ".join(result), mutations, trace
 
 
 @app.get("/health")
@@ -272,7 +322,7 @@ def transform(req: PromptRequest):
     result = sim.run(qc, shots=1).result()
     bitstring = list(result.get_counts())[0].replace(" ", "")
 
-    mutated, mutations = mutate_prompt(req.prompt, bitstring, angles)
+    mutated, mutations, trace = mutate_prompt(req.prompt, bitstring, angles)
 
     return TransformResponse(
         original=req.prompt,
@@ -280,4 +330,6 @@ def transform(req: PromptRequest):
         bitstring=bitstring,
         qubits_used=n,
         mutations=mutations,
+        trace=trace,
+        angles=[round(a, 4) for a in angles],
     )
